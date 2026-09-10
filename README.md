@@ -17,5 +17,55 @@
 > [!WARNING]
 > All commercial and profit-making use of this program is strictly prohibited. Use of this program is at your own risk, and the developers of this program shall not be liable for any liability, including civil or criminal liability. By downloading this program, all users are deemed to agree to the above terms without any objection.
 
+## 이 포크에서 변경한 것
+
+코레일(KTX) API가 막혀서 동작하지 않던 것을 되살린 포크입니다. SRT 쪽은 원본 그대로입니다.
+
+### 증상
+
+`smart.letskorail.com`으로 보내는 모든 요청이 아래 응답으로 차단됩니다. 로그인부터 실패합니다.
+
+```json
+{"strResult": "FAIL", "h_msg_cd": "MACRO ERROR",
+ "h_msg_txt": "원활한 서비스 이용을 위해 앱을 최신 버전으로 업데이트한 뒤 재실행 후 안정적인 환경에서 사용해 주시기 바랍니다."}
+```
+
+### 원인
+
+에러 문구와 달리 **앱 버전(`Version`) 값 문제가 아닙니다.** 코레일이 요청에 서명 토큰을 요구하도록 바꿨고, `x-dynapath-m-token` 헤더와 `Sid` 파라미터가 없으면 무조건 차단됩니다.
+
+같은 길을 다시 걷지 않도록, 확인해 본 것과 결과를 적어둡니다.
+
+| 시도 | 결과 |
+| --- | --- |
+| 앱 버전 8종 (`190617001` ~ `260523001`) | 전부 동일하게 MACRO ERROR |
+| curl_cffi TLS 위장 (`chrome131_android`) | 실패 (원본에 이미 적용돼 있었음) |
+| 평범한 requests / okhttp UA / gzip 헤더 제거 | 전부 실패 |
+| `txtDeviceId`, `Sid` 등 파라미터 추가 | 전부 실패 |
+| `code.do` (로그인 전 암호화 키 조회) | **성공** — 서버는 살아 있음 |
+| **Dynapath 토큰 적용** | **성공** |
+
+### 해결
+
+[jinizest/SuperK](https://github.com/jinizest/SuperK)의 `DynaPathMasterEngine`을 `srtgo/ktx.py`에 이식했습니다. 원본과 클래스·메서드·시그니처가 모두 같아서 `srtgo.py`는 손대지 않아도 그대로 동작합니다.
+
+```
+이전:  MACRO ERROR  원활한 서비스 이용을 위해 앱을 최신 버전으로...
+이후:  WRT200320    잘못 입력하셨습니다(회원번호)   ← 서버가 정상 처리
+```
+
+로그인, 조회, 예약, 카드결제까지 실계정으로 확인했습니다.
+
+### 함께 바뀐 것
+
+- **조회 간격 3초** (기존 1.25초, 분당 48회). 코레일 매크로 탐지가 적극적이라 늦췄습니다. 취소표 경쟁이 심하면 `SRTGO_INTERVAL=1.5 srtgo`로 조절하세요.
+- **apkpure 버전 스크래핑 제거.** 로그인마다 외부요청 2건인데 결과는 0개였고, `\d{9}` 정규식이라 페이지의 아무 9자리 숫자나 후보 맨 앞에 꽂히는 구조였습니다. 버전 고정이 필요하면 `KORAIL_VERSION` 환경변수를 쓰세요.
+- **`set_login` 예외 처리.** `SRTError`만 잡고 있어서 코레일 로그인 실패가 크래시로 이어지던 것을 고쳤습니다.
+
+### 다시 막힌다면
+
+`srtgo/ktx.py`의 `DynaPathMasterEngine` 상수(`table`, `i8` / `i9` / `i10`, `AS_VALUE`)가 갱신 대상입니다. 코레일이 서명 방식을 바꾸면 이 값들이 달라집니다.
+
 ## Acknowledgments
 - This project includes code from [SRT](https://github.com/ryanking13/SRT) by ryanking13, licensed under the MIT License, and [korail2](https://github.com/carpedm20/korail2) by carpedm20, licensed under the BSD License.
+- Dynapath bypass ported from [SuperK](https://github.com/jinizest/SuperK) by jinizest.
