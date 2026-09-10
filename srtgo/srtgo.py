@@ -13,6 +13,7 @@ import asyncio
 import click
 import inquirer
 import keyring
+import os
 import telegram
 import time
 import re
@@ -117,10 +118,13 @@ DEFAULT_STATIONS = {
     "KTX": ["서울", "대전", "동대구", "부산"],
 }
 
-# 예약 간격 (평균 간격 (초) = SHAPE * SCALE): gamma distribution (1.25 +/- 0.25 s)
+# 조회 간격: gamma 분포, 평균 = SHAPE * SCALE + MIN
+# ponytail: 기본 1.25초(분당 48회)는 코레일 매크로 탐지에 걸리기 쉬워 3초로 늦춤.
+# 취소표 경쟁이 심하면 SRTGO_INTERVAL=1.5 처럼 환경변수로 조절.
+RESERVE_INTERVAL_MEAN = float(os.environ.get("SRTGO_INTERVAL") or 3.0)
+RESERVE_INTERVAL_MIN = RESERVE_INTERVAL_MEAN / 6
 RESERVE_INTERVAL_SHAPE = 4
-RESERVE_INTERVAL_SCALE = 0.25
-RESERVE_INTERVAL_MIN = 0.25
+RESERVE_INTERVAL_SCALE = (RESERVE_INTERVAL_MEAN - RESERVE_INTERVAL_MIN) / RESERVE_INTERVAL_SHAPE
 
 WAITING_BAR = ["|", "/", "-", "\\"]
 
@@ -424,9 +428,12 @@ def set_login(rail_type="SRT", debug=False):
         keyring.set_password(rail_type, "pass", login_info["pass"])
         keyring.set_password(rail_type, "ok", "1")
         return True
-    except SRTError as err:
+    except (SRTError, KorailError) as err:
         print(err)
-        keyring.delete_password(rail_type, "ok")
+        try:
+            keyring.delete_password(rail_type, "ok")
+        except keyring.errors.PasswordDeleteError:
+            pass
         return False
 
 

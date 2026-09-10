@@ -7,6 +7,8 @@ korail2.korail2
 """
 
 import base64
+import os
+import random
 try:
     import curl_cffi
     HAS_CURL_CFFI = True
@@ -16,6 +18,7 @@ except ImportError:
 import itertools
 import json
 import re
+import string
 import time
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
@@ -29,6 +32,19 @@ PHONE_NUMBER_REGEX = re.compile(r"(\d{3})-(\d{3,4})-(\d{4})")
 
 USER_AGENT = "Dalvik/2.1.0 (Linux; U; Android 14; SM-S912N Build/UP1A.231005.007)"
 
+
+def _load_user_agent_candidates() -> tuple[str, ...]:
+    env_candidates = os.environ.get("KORAIL_USER_AGENT_CANDIDATES", "")
+    user_agents = [value.strip() for value in env_candidates.split("||") if value.strip()]
+    user_agents.extend(
+        [
+            USER_AGENT,
+            "okhttp/4.12.0",
+            "Mozilla/5.0 (Linux; Android 14; SM-S918N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Mobile Safari/537.36",
+        ]
+    )
+    return tuple(dict.fromkeys(user_agents))
+
 DEFAULT_HEADERS = {
     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     "User-Agent": USER_AGENT,
@@ -36,6 +52,215 @@ DEFAULT_HEADERS = {
     "Connection": "Keep-Alive",
     "Accept-Encoding": "gzip",
 }
+
+USER_AGENT_CANDIDATES = _load_user_agent_candidates()
+
+DYNAPATH_PATHS = (
+    "/classes/com.korail.mobile.certification.TicketReservation",
+    "/classes/com.korail.mobile.nonMember.NonMemTicket",
+    "/classes/com.korail.mobile.seatMovie.ScheduleView",
+    "/classes/com.korail.mobile.seatMovie.ScheduleViewSpecial",
+    "/classes/com.korail.mobile.trn.prcFare.do",
+    "/classes/com.korail.mobile.login.Login",
+)
+
+
+class DynaPathMasterEngine:
+    APP_ID = "com.korail.talk"
+    AS_VALUE = "%5B38ff229cb34c7dda8e28220a2d750cce%5D"
+    DEVICE_MODEL = "SM-S928N"
+    OS_TYPE = "Android"
+    SDK_VERSION = "v1"
+
+    def __init__(self):
+        self.table = "3FE9jgRD4KdCyuawklqGJYmvfMn15P7US8XbxeLQtWT6OicBAopINs2Vh0HZrz"
+        self.i8, self.i9, self.i10 = 161, 30, 2
+        self.app_start_ts = str(int(time.time() * 1000))
+
+    def string2xA1s(self, data_str):
+        result = []
+        i = 0
+        while i < len(data_str):
+            cp = ord(data_str[i])
+            i += 1
+            if cp < 128:
+                result.append(cp)
+            elif cp < 2048:
+                result.append(128 | ((cp >> 7) & 15))
+                result.append(cp & 127)
+            elif cp >= 262144:
+                result.append(160)
+                result.append((cp >> 14) & 127)
+                result.append((cp >> 7) & 127)
+                result.append(cp & 127)
+            elif (63488 & cp) != 55296:
+                result.append(((cp >> 14) & 15) | 144)
+                result.append((cp >> 7) & 127)
+                result.append(cp & 127)
+        return result
+
+    def make_key(self, key_str):
+        big_int_add = 0
+        for char in key_str:
+            cp = ord(char)
+            i9_bit = 32768
+            for _ in range(16):
+                if (i9_bit & cp) != 0:
+                    break
+                i9_bit >>= 1
+            big_int_add = (big_int_add * (i9_bit << 1)) + cp
+        return big_int_add
+
+    def _internal_i(self, base_table, remainder, current_sb):
+        j8_count = 0
+        for char in base_table:
+            if char not in current_sb:
+                if j8_count == remainder:
+                    return char
+                j8_count += 1
+        return " "
+
+    def make_encode_table(self, num, encode_size, base_table):
+        sb = ""
+        temp_num = num
+        for i in range(encode_size):
+            divisor = encode_size - i
+            remainder = temp_num % divisor
+            sb += self._internal_i(base_table, remainder, sb)
+            temp_num //= divisor
+        return sb
+
+    def encode_normal_be(self, data_str, table, i8=161, i9=30, i10=2):
+        list_data = self.string2xA1s(data_str)
+        sb, i_arr = [], [0] * (i10 + 1)
+        idx, size = 0, len(list_data) % i10
+        size2 = len(list_data) - size
+
+        while idx < size2:
+            val = 0
+            for _ in range(i10):
+                val = (val * i8) + list_data[idx]
+                idx += 1
+            for i in range(i10 + 1):
+                i_arr[i] = val % i9
+                val //= i9
+            for i in range(i10, -1, -1):
+                sb.append(table[i_arr[i]])
+
+        if size > 0:
+            val = 0
+            for _ in range(size):
+                val = (val * i8) + list_data[idx]
+                idx += 1
+            for i in range(size + 1):
+                i_arr[i] = val % i9
+                val //= i9
+            while size >= 0:
+                sb.append(table[i_arr[size]])
+                size -= 1
+
+        return "".join(sb)
+
+    def generate_token(self, device_id, ts, rand):
+        plaintext = (
+            f"ai={self.APP_ID}&di={device_id}&as={self.AS_VALUE}&"
+            f"su=false&dbg=false&emu=false&hk=false&it={self.app_start_ts}&"
+            f"ts={ts}&rt=0&os=13&dm={self.DEVICE_MODEL}&st={self.OS_TYPE}&sv={self.SDK_VERSION}"
+        )
+        dyn_key = f"v1+{rand}+{ts}"
+        key_enc = self.encode_normal_be(dyn_key, self.table, self.i8, self.i9, self.i10)
+        big_key = self.make_key(dyn_key)
+        custom_table = self.make_encode_table(big_key, self.i9, self.table)
+        body_enc = self.encode_normal_be(plaintext, custom_table, self.i8, self.i9, self.i10)
+        return f"bEeEP{self.table[len(key_enc)]}{key_enc}{body_enc}"
+
+def _load_korail_version_candidates():
+    """Load Korail app version candidates from env, newest first."""
+
+    env_candidates = os.environ.get("KORAIL_VERSION_CANDIDATES", "")
+    versions = [
+        value.strip()
+        for value in env_candidates.split(",")
+        if value.strip()
+    ]
+
+    # 단일 버전 고정이 필요할 때 사용 (예: KORAIL_VERSION=260301001)
+    force_version = os.environ.get("KORAIL_VERSION", "").strip()
+    if force_version:
+        versions.insert(0, force_version)
+
+    # 최신값부터 순차 시도 (실제 서비스에서 차단 시 다음 버전으로 fallback)
+    versions.extend(
+        [
+            "250601002",  # dhfhfk/korail2 bypassDynapath default
+            "260523001",  # 2026-05 fallback
+            "260501001",
+            "260401001",
+            "260301001",
+            "260212001",
+            "251218001",
+            "250305001",
+            "240531001",
+        ]
+    )
+
+    # 순서 유지하면서 중복 제거
+    return tuple(dict.fromkeys(versions))
+
+
+KORAIL_VERSION_CANDIDATES = _load_korail_version_candidates()
+
+
+def _load_korail_device_candidates() -> tuple[str, ...]:
+    env_candidates = os.environ.get("KORAIL_DEVICE_CANDIDATES", "")
+    devices = [value.strip().upper() for value in env_candidates.split(",") if value.strip()]
+    devices.extend(["AD", "IP"])
+    return tuple(dict.fromkeys(devices))
+
+
+KORAIL_DEVICE_CANDIDATES = _load_korail_device_candidates()
+
+
+def _discover_korail_version_candidates(timeout: int = 3) -> tuple[str, ...]:
+    """Best-effort online discovery for newest Korail app version codes."""
+    urls = (
+        "https://d.apkpure.com/b/APK/com.korail.talk?version=latest",
+        "https://apkpure.com/korailtalk/com.korail.talk",
+    )
+    discovered: list[str] = []
+    pattern = re.compile(r"\b(\d{9})\b")
+
+    for url in urls:
+        try:
+            if HAS_CURL_CFFI:
+                response = curl_cffi.requests.get(url, timeout=timeout, allow_redirects=True)
+            else:
+                response = requests.get(url, timeout=timeout, allow_redirects=True)
+            text = getattr(response, "text", "") or ""
+            for match in pattern.findall(text):
+                discovered.append(match)
+        except Exception:
+            continue
+
+    return tuple(dict.fromkeys(discovered))
+
+
+def _merge_discovered_candidates() -> tuple[str, ...]:
+    # ponytail: apkpure 스크래핑 제거. 매 로그인마다 외부요청 2건인데 결과는 0개였고,
+    # \d{9} 정규식이라 페이지의 아무 9자리 숫자나 후보 맨 앞에 꽂히는 구조였음.
+    # 버전이 다시 막히면 KORAIL_VERSION 환경변수로 지정하면 됨.
+    return KORAIL_VERSION_CANDIDATES
+
+
+def _prioritize_korail_version(version: str) -> None:
+    """Move a successful Korail version to the front for subsequent logins."""
+    global KORAIL_VERSION_CANDIDATES
+    v = (version or "").strip()
+    if not v:
+        return
+    ordered = [v, *[item for item in KORAIL_VERSION_CANDIDATES if item != v]]
+    KORAIL_VERSION_CANDIDATES = tuple(dict.fromkeys(ordered))
+
 
 KORAIL_MOBILE = "https://smart.letskorail.com:443/classes/com.korail.mobile"
 API_ENDPOINTS = {
@@ -508,14 +733,17 @@ class NetFunnelHelper:
 class Korail:
     """Main Korail API interface"""
 
-    def __init__(self, korail_id, korail_pw, auto_login=True, verbose=False):
+    def __init__(self, korail_id=None, korail_pw=None, auto_login=True, verbose=False):
         if HAS_CURL_CFFI:
             self._session = curl_cffi.Session(impersonate="chrome131_android")
         else:
             self._session = requests.session()
         self._session.headers.update(DEFAULT_HEADERS)
         self._device = "AD"
-        self._version = "240531001"
+        self._version = KORAIL_VERSION_CANDIDATES[0]
+        self._sid_key = b"2485dd54d9deaa36"
+        self._device_id = os.environ.get("KORAIL_DEVICE_ID", "558a4f02041657ea")
+        self._engine = DynaPathMasterEngine()
         self._key = "korail1234567890"
         self._idx = None
         self.korail_id = korail_id
@@ -532,6 +760,37 @@ class Korail:
     def _log(self, msg: str) -> None:
         if self.verbose:
             print(f"[*] {msg}")
+
+    def _generate_sid(self, ts):
+        plaintext = f"{self._device}{ts}".encode("utf-8")
+        cipher = AES.new(self._sid_key, AES.MODE_CBC, iv=self._sid_key)
+        return base64.b64encode(cipher.encrypt(pad(plaintext, 16))).decode("utf-8") + "\n"
+
+    def _get_auth_headers_and_sid(self, url):
+        headers = {}
+        sid = None
+        if any(path in url for path in DYNAPATH_PATHS):
+            ts = int(time.time() * 1000)
+            rand = "".join(random.choices(string.ascii_uppercase + string.digits, k=4))
+            headers["x-dynapath-m-token"] = self._engine.generate_token(
+                self._device_id, ts, rand
+            )
+            sid = self._generate_sid(ts)
+        return headers, sid
+
+    def _auth_get(self, url, params=None, **kwargs):
+        headers, sid = self._get_auth_headers_and_sid(url)
+        if sid:
+            params = dict(params or {})
+            params["Sid"] = sid
+        return self._session.get(url, params=params, headers=headers, **kwargs)
+
+    def _auth_post(self, url, data=None, **kwargs):
+        headers, sid = self._get_auth_headers_and_sid(url)
+        if sid:
+            data = dict(data or {})
+            data["Sid"] = sid
+        return self._session.post(url, data=data, headers=headers, **kwargs)
 
     def __enc_password(self, password):
         url = API_ENDPOINTS["code"]
@@ -565,33 +824,62 @@ class Korail:
             else "2"
         )
 
-        data = {
-            "Device": self._device,
-            "Version": self._version,
-            "Key": self._key,
-            "txtMemberNo": self.korail_id,
-            "txtPwd": self.__enc_password(self.korail_pw),
-            "txtInputFlg": txt_input_flg,
-            "idx": self._idx,
-        }
+        last_error = ("로그인에 실패했습니다.", None)
 
-        r = self._session.post(API_ENDPOINTS["login"], data=data)
-        self._log(r.text)
-        j = json.loads(r.text)
+        version_candidates = _merge_discovered_candidates()
+        for version in version_candidates:
+            for device in KORAIL_DEVICE_CANDIDATES:
+                for user_agent in USER_AGENT_CANDIDATES:
+                    self._device = device
+                    self._session.headers["User-Agent"] = user_agent
+                    enc_password = self.__enc_password(self.korail_pw)
+                    data = {
+                        "Device": self._device,
+                        "Version": version,
+                        "Key": self._key,
+                        "txtMemberNo": self.korail_id,
+                        "txtPwd": enc_password,
+                        "txtInputFlg": txt_input_flg,
+                        "idx": self._idx,
+                    }
 
-        if j["strResult"] == "SUCC" and j.get("strMbCrdNo"):
-            # self._key = j['Key']
-            self.membership_number = j["strMbCrdNo"]
-            self.name = j["strCustNm"]
-            self.email = j["strEmailAdr"]
-            self.phone_number = j["strCpNo"]
-            print(
-                f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
-            )
-            self.logined = True
-            return True
+                    r = self._auth_post(API_ENDPOINTS["login"], data=data)
+                    self._log(r.text)
+                    j = json.loads(r.text)
+
+                    if j["strResult"] == "SUCC" and j.get("strMbCrdNo"):
+                        self._version = version
+                        _prioritize_korail_version(version)
+                        self._key = j.get("Key", self._key)
+                        self.membership_number = j["strMbCrdNo"]
+                        self.name = j["strCustNm"]
+                        self.email = j["strEmailAdr"]
+                        self.phone_number = j["strCpNo"]
+                        print(
+                            f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
+                        )
+                        self.logined = True
+                        return True
+
+                    h_msg_txt = j.get("h_msg_txt") or "로그인에 실패했습니다."
+                    h_msg_cd = j.get("h_msg_cd")
+                    last_error = (h_msg_txt, h_msg_cd)
+
+                    if "MACRO ERROR" in h_msg_txt or "최신 버전" in h_msg_txt:
+                        time.sleep(0.15)
+                        continue
+
+                    break
+                else:
+                    continue
+                break
+            else:
+                continue
+            break
+
+
         self.logined = False
-        return False
+        raise KorailError(*last_error)
 
     def logout(self):
         r = self._session.get(API_ENDPOINTS["logout"])
@@ -669,7 +957,7 @@ class Korail:
             "mbCrdNo": self.membership_number,
         }
 
-        r = self._session.get(API_ENDPOINTS["search_schedule"], params=data)
+        r = self._auth_get(API_ENDPOINTS["search_schedule"], params=data)
         self._log(r.text)
         j = json.loads(r.text)
 
@@ -757,7 +1045,7 @@ class Korail:
         for i, psg in enumerate(passengers, 1):
             data.update(psg.get_dict(i))
 
-        r = self._session.get(API_ENDPOINTS["reserve"], params=data)
+        r = self._auth_get(API_ENDPOINTS["reserve"], params=data)
         self._log(r.text)
         j = json.loads(r.text)
         if self._result_check(j):
