@@ -35,6 +35,8 @@ class FakeKeyring:
         self.data.pop((service, key), None)
 
 
+ENTER = chr(13)
+
 SEED = {
     ("KTX", "departure"): "포항",
     ("KTX", "arrival"): "영덕",
@@ -173,6 +175,62 @@ def test_keys_move_state_and_quit():
 
     assert state.picked == {0, 1}, f"선택 상태가 이상함: {state.picked}"
     assert state.cursor == 1
+
+
+def test_hangul_keys_work_as_shortcuts():
+    """IME 가 켜져 있어도 같은 자리 키가 먹혀야 한다. q=ㅂ, e=ㄷ."""
+    fake_keyring()
+    state = tui.State("KTX")
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            app = tui.build_app(state)
+            seen = {}
+
+            def drive():
+                time.sleep(0.2)
+                pipe.send_text("ㄷ")          # e: 조건 화면 열기
+                time.sleep(0.3)
+                seen["after_d"] = state.screen
+                pipe.send_text("ㅂ")          # q: 뒤로
+                time.sleep(0.3)
+                seen["after_b"] = state.screen
+                pipe.send_text("ㅂ")          # q: 종료
+
+            threading.Thread(target=drive, daemon=True).start()
+            app.run()
+
+    assert seen["after_d"] == "form", f"ㄷ 로 조건 화면이 안 열림: {seen}"
+    assert seen["after_b"] == "dash", f"ㅂ 로 뒤로가기가 안 됨: {seen}"
+
+
+def test_hangul_typing_still_reaches_buffer():
+    """입력 화면에서는 한글 자모도 단축키가 아니라 글자로 들어가야 한다."""
+    fake_keyring()
+    state = tui.State("KTX")
+    state.fields = tui.setting_fields(state)
+    state.fcur = 10               # 텔레그램 chat_id (마스킹 없는 text)
+    state.screen = "edit"
+    state.buf = ""
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            app = tui.build_app(state)
+
+            def drive():
+                time.sleep(0.2)
+                pipe.send_text("ㅂㄷ가")
+                time.sleep(0.3)
+                pipe.send_text(ENTER)
+                time.sleep(0.2)
+                state.screen = "dash"
+                pipe.send_text("q")
+
+            threading.Thread(target=drive, daemon=True).start()
+            app.run()
+
+    assert (tui.core.keyring.get_password("telegram", "chat_id")
+            == "ㅂㄷ가"), "입력 화면에서 한글이 단축키로 새어나감"
 
 
 def test_typing_goes_to_buffer_not_shortcuts():

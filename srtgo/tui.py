@@ -48,6 +48,19 @@ PHASE_TEXT = {
 
 SPINNER = "|/-\\"
 
+# 한글 IME 가 켜진 채로 단축키를 누르면 같은 자리의 자모가 들어온다.
+# q 를 눌러도 터미널에는 "ㅂ" 이 도착하므로 두벌식 자리를 그대로 별칭으로 붙인다.
+HANGUL_ALIAS = dict(zip(
+    "qwertyuiopasdfghjklzxcvbnm",
+    "ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔㅁㄴㅇㄹㅎㅗㅓㅏㅣㅋㅌㅊㅍㅠㅜㅡ",
+))
+
+
+def key_aliases(key):
+    """영문 키와 같은 자리의 한글 자모를 함께 돌려준다."""
+    alias = HANGUL_ALIAS.get(key)
+    return [key, alias] if alias else [key]
+
 WIDTH = 62  # 화면 폭(칸). 한글은 2칸이라 len() 이 아니라 get_cwidth() 로 센다.
 
 
@@ -811,10 +824,11 @@ def build_app(state):
     not_typing = ~typing
 
     def shortcut(key, handler):
-        @kb.add(key, filter=not_typing)
-        def _(event):
+        def on_key(event):
             if state.screen == "dash":
                 handler(event)
+        for alias in key_aliases(key):
+            kb.add(alias, filter=not_typing)(on_key)
 
     def on_q(event):
         if state.phase in ("running", "paused"):
@@ -826,9 +840,7 @@ def build_app(state):
             state.stop.set()
             event.app.exit()
 
-    @kb.add("q", filter=not_typing)
-    @kb.add("c-c")
-    def _(event):
+    def on_back(event):
         if state.screen == "edit":
             state.screen = "form"  # c-c 는 입력 취소
             return
@@ -836,6 +848,10 @@ def build_app(state):
             state.screen = "form" if state.screen == "pick" else "dash"
             return
         on_q(event)
+
+    for alias in key_aliases("q"):
+        kb.add(alias, filter=not_typing)(on_back)
+    kb.add("c-c")(on_back)
 
     shortcut("r", lambda event: (
         _spawn(do_search, state, app)
