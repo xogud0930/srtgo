@@ -36,6 +36,9 @@ class FakeKeyring:
 
 
 ENTER = chr(13)
+ESC = chr(27)
+F2 = ESC + 'OQ'
+F3 = ESC + 'OR'
 
 SEED = {
     ("KTX", "departure"): "포항",
@@ -202,6 +205,43 @@ def test_hangul_keys_work_as_shortcuts():
 
     assert seen["after_d"] == "form", f"ㄷ 로 조건 화면이 안 열림: {seen}"
     assert seen["after_b"] == "dash", f"ㅂ 로 뒤로가기가 안 됨: {seen}"
+
+
+def test_function_keys_bypass_ime():
+    """IME 가 자모를 물고 있어도 F키/Esc 는 그대로 도착해야 한다."""
+    fake_keyring()
+    state = tui.State("KTX")
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            app = tui.build_app(state)
+            seen = {}
+
+            def drive():
+                time.sleep(0.2)
+                pipe.send_text(F2)            # 조건 화면
+                time.sleep(0.3)
+                seen["f2"] = (state.screen, state.form_title)
+                pipe.send_text(ESC)           # 뒤로
+                time.sleep(0.3)
+                pipe.send_text(F3)            # 설정 화면
+                time.sleep(0.3)
+                seen["f3"] = (state.screen, state.form_title)
+                pipe.send_text(ESC)           # 뒤로
+                time.sleep(0.2)
+                # 단독 ESC 는 이스케이프 시퀀스 시작일 수도 있어서 파서가 붙들고
+                # 있다가 다음 입력이 와야 확정한다. 아무 키나 보내 흘려보낸다.
+                pipe.send_text("z")           # 바인딩 없는 키
+                time.sleep(0.3)
+                seen["back"] = state.screen
+                pipe.send_text("q")           # 종료
+
+            threading.Thread(target=drive, daemon=True).start()
+            app.run()
+
+    assert seen["f2"] == ("form", "예매 조건"), f"F2 가 조건을 못 엶: {seen}"
+    assert seen["f3"] == ("form", "설정"), f"F3 가 설정을 못 엶: {seen}"
+    assert seen["back"] == "dash", f"Esc 뒤로가기 실패: {seen}"
 
 
 def test_hangul_typing_still_reaches_buffer():

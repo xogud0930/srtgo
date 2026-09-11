@@ -56,10 +56,22 @@ HANGUL_ALIAS = dict(zip(
 ))
 
 
+# IME 가 한글이면 자음 하나는 조합 버퍼에 남아 터미널까지 아예 안 온다.
+# 그래서 자모 별칭만으로는 부족하고, IME 를 타지 않는 키를 따로 준다.
+# 화살표/Enter/Space/Esc/F키/Ctrl 조합은 조합 대상이 아니라 항상 그대로 도착한다.
+FUNCTION_ALIAS = {"e": "f2", "s": "f3", "t": "f4", "r": "f5", "p": "f6"}
+
+
 def key_aliases(key):
-    """영문 키와 같은 자리의 한글 자모를 함께 돌려준다."""
+    """같은 동작에 묶을 키들. 영문 + 같은 자리 한글 자모 + F키."""
+    keys = [key]
     alias = HANGUL_ALIAS.get(key)
-    return [key, alias] if alias else [key]
+    if alias:
+        keys.append(alias)
+    fkey = FUNCTION_ALIAS.get(key)
+    if fkey:
+        keys.append(fkey)
+    return keys
 
 WIDTH = 62  # 화면 폭(칸). 한글은 2칸이라 len() 이 아니라 get_cwidth() 로 센다.
 
@@ -71,6 +83,21 @@ def pad(text, width):
 
 def rpad(text, width):
     return " " * max(0, width - get_cwidth(text)) + text
+
+
+def emit_hints(line, hints):
+    """[키] 설명 목록을 화면 폭에 맞춰 접어서 출력."""
+    parts, width = [], 0
+    for key, desc in hints:
+        chunk = [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
+        size = get_cwidth(f"  [{key}] {desc}")
+        if parts and width + size > WIDTH:
+            line(*parts)
+            parts, width = [], 0
+        parts += chunk
+        width += size
+    if parts:
+        line(*parts)
 
 
 def rule(title):
@@ -267,20 +294,18 @@ def render(state):
     line()
 
     # 키 안내
+    # 한글 IME 가 켜져 있으면 영문 단축키가 안 먹으므로 F키/Esc 를 같이 보여준다.
     hints = {
-        "idle": [("Enter", "조회"), ("e", "조건"), ("s", "설정"),
-                 ("t", "SRT/KTX"), ("q", "종료")],
+        "idle": [("Enter", "조회"), ("e/F2", "조건"), ("s/F3", "설정"),
+                 ("t/F4", "전환"), ("Esc", "종료")],
         "picking": [("up/dn", "이동"), ("Space", "선택"), ("Enter", "시작"),
-                    ("r", "재조회"), ("q", "취소")],
-        "running": [("p", "일시정지"), ("q", "중지")],
-        "paused": [("p", "재개"), ("q", "중지")],
-        "done": [("Enter", "처음으로"), ("q", "종료")],
-        "error": [("Enter", "처음으로"), ("s", "설정"), ("q", "종료")],
-    }.get(state.phase, [("q", "종료")])
-    parts = []
-    for key, desc in hints:
-        parts += [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
-    line(*parts)
+                    ("r/F5", "재조회"), ("Esc", "취소")],
+        "running": [("p/F6", "일시정지"), ("Esc", "중지")],
+        "paused": [("p/F6", "재개"), ("Esc", "중지")],
+        "done": [("Enter", "처음으로"), ("Esc", "종료")],
+        "error": [("Enter", "다시"), ("s/F3", "설정"), ("Esc", "종료")],
+    }.get(state.phase, [("Esc", "종료")])
+    emit_hints(line, hints)
     return out
 
 
@@ -522,10 +547,7 @@ def render_pick(state, line):
     hints = ([("up/dn", "이동"), ("Space", "선택"), ("Enter", "완료"), ("Esc", "취소")]
              if state.pick_multi else
              [("up/dn", "이동"), ("Enter", "선택"), ("Esc", "취소")])
-    parts = []
-    for key, desc in hints:
-        parts += [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
-    line(*parts)
+    emit_hints(line, hints)
 
 
 def render_form(state, line):
@@ -753,13 +775,13 @@ def build_app(state):
 
     @kb.add("escape", eager=True)
     def _(event):
-        if state.screen == "edit":
-            state.screen = "form"
-        elif state.screen == "pick":
+        if state.screen in ("edit", "pick"):
             state.screen = "form"
         elif state.screen == "form":
             state.screen = "dash"
             state.fields = []
+        else:
+            on_back(event)
 
     @kb.add("space")
     def _(event):
@@ -852,6 +874,7 @@ def build_app(state):
     for alias in key_aliases("q"):
         kb.add(alias, filter=not_typing)(on_back)
     kb.add("c-c")(on_back)
+    # escape 는 위쪽에서 form/pick/edit 을 처리한다. 대시보드에서만 q 와 같게.
 
     shortcut("r", lambda event: (
         _spawn(do_search, state, app)
