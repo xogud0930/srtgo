@@ -137,10 +137,9 @@ DEFAULT_STATIONS = {
 # 조회 간격: gamma 분포, 평균 = SHAPE * SCALE + MIN
 # ponytail: 기본 1.25초(분당 48회)는 코레일 매크로 탐지에 걸리기 쉬워 3초로 늦춤.
 # 취소표 경쟁이 심하면 SRTGO_INTERVAL=1.5 처럼 환경변수로 조절.
-RESERVE_INTERVAL_MEAN = float(os.environ.get("SRTGO_INTERVAL") or 3.0)
-RESERVE_INTERVAL_MIN = RESERVE_INTERVAL_MEAN / 6
+RESERVE_INTERVAL_DEFAULT = float(os.environ.get("SRTGO_INTERVAL") or 3.0)
 RESERVE_INTERVAL_SHAPE = 4
-RESERVE_INTERVAL_SCALE = (RESERVE_INTERVAL_MEAN - RESERVE_INTERVAL_MIN) / RESERVE_INTERVAL_SHAPE
+RESERVE_INTERVAL_RANGE = (0.5, 60.0)
 
 WAITING_BAR = ["|", "/", "-", "\\"]
 
@@ -301,6 +300,26 @@ def set_options():
 
     options = choices.get("options", [])
     keyring.set_password("SRT", "options", ",".join(options))
+
+    low, high = RESERVE_INTERVAL_RANGE
+    answer = inquirer.prompt(
+        [
+            inquirer.Text(
+                "interval",
+                message=f"조회 간격 평균 (초, {low}~{high}. 짧을수록 취소표를 빨리 잡지만 차단 위험이 커짐)",
+                default=str(get_interval()),
+            )
+        ]
+    )
+    if answer is None:
+        return
+    try:
+        interval = min(max(float(answer["interval"]), low), high)
+    except ValueError:
+        print(colored(f"숫자가 아닙니다. {get_interval()}초 유지", "green", "on_red"))
+        return
+    keyring.set_password("SRT", "interval", str(interval))
+    print(f"조회 간격: 평균 {interval}초 (분당 약 {60 / interval:.0f}회)")
 
 
 def get_options():
@@ -680,24 +699,34 @@ def reserve(rail_type="SRT", debug=False):
 
     # Get seat type preference
     seat_type = SeatType if is_srt else ReserveOption
+    seat_choices = [
+        ("일반실 우선", seat_type.GENERAL_FIRST),
+        ("일반실만", seat_type.GENERAL_ONLY),
+        ("특실 우선", seat_type.SPECIAL_FIRST),
+        ("특실만", seat_type.SPECIAL_ONLY),
+    ]
+    saved_seat = keyring.get_password(rail_type, "seat_type")
     q_options = [
         inquirer.List(
             "type",
             message="선택 유형",
-            choices=[
-                ("일반실 우선", seat_type.GENERAL_FIRST),
-                ("일반실만", seat_type.GENERAL_ONLY),
-                ("특실 우선", seat_type.SPECIAL_FIRST),
-                ("특실만", seat_type.SPECIAL_ONLY),
-            ],
+            choices=seat_choices,
+            default=saved_seat if saved_seat in [v for _, v in seat_choices] else None,
         ),
-        inquirer.Confirm("pay", message="예매 시 카드 결제", default=False),
+        inquirer.Confirm(
+            "pay",
+            message="예매 시 카드 결제",
+            default=keyring.get_password(rail_type, "pay") == "1",
+        ),
     ]
 
     options = inquirer.prompt(q_options)
     if options is None:
         print(colored("예매 정보 입력 중 취소되었습니다", "green", "on_red") + "\n")
         return
+
+    keyring.set_password(rail_type, "seat_type", options["type"])
+    keyring.set_password(rail_type, "pay", "1" if options["pay"] else "0")
 
     # Reserve function
     def _reserve(train):
@@ -805,11 +834,21 @@ def reserve(rail_type="SRT", debug=False):
             rail = login(rail_type, debug=debug)
 
 
+def get_interval() -> float:
+    """저장된 조회 간격(평균 초). 없거나 망가졌으면 기본값."""
+    try:
+        value = float(keyring.get_password("SRT", "interval"))
+    except (TypeError, ValueError):
+        return RESERVE_INTERVAL_DEFAULT
+    low, high = RESERVE_INTERVAL_RANGE
+    return min(max(value, low), high)
+
+
 def _sleep():
-    time.sleep(
-        gammavariate(RESERVE_INTERVAL_SHAPE, RESERVE_INTERVAL_SCALE)
-        + RESERVE_INTERVAL_MIN
-    )
+    # 평균 = mean, 최소 = mean/6. 일정한 주기는 탐지에 걸리기 쉬워 gamma 분포로 흩뜨림.
+    mean = get_interval()
+    floor = mean / 6
+    time.sleep(gammavariate(RESERVE_INTERVAL_SHAPE, (mean - floor) / RESERVE_INTERVAL_SHAPE) + floor)
 
 
 def _handle_error(ex, msg=None):
