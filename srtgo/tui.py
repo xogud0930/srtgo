@@ -302,8 +302,8 @@ def render(state):
                     ("r/F5", "재조회"), ("Esc", "취소")],
         "running": [("p/F6", "일시정지"), ("Esc", "중지")],
         "paused": [("p/F6", "재개"), ("Esc", "중지")],
-        "done": [("Enter", "처음으로"), ("Esc", "종료")],
-        "error": [("Enter", "다시"), ("s/F3", "설정"), ("Esc", "종료")],
+        "done": [("Enter", "처음으로"), ("Esc", "처음으로")],
+        "error": [("Enter", "다시"), ("s/F3", "설정"), ("Esc", "처음으로")],
     }.get(state.phase, [("Esc", "종료")])
     emit_hints(line, hints)
     return out
@@ -853,11 +853,18 @@ def build_app(state):
             kb.add(alias, filter=not_typing)(on_key)
 
     def on_q(event):
+        """대시보드에서는 한 단계씩 물러난다. 더 물러날 데가 없을 때만 종료."""
         if state.phase in ("running", "paused"):
             state.stop.set()
             state.pause.clear()
-            _note(state, app, "중지됨", "idle")
             state.stop = threading.Event()
+            _note(state, app, "중지됨", "idle")
+        elif state.phase in ("picking", "done", "error", "search", "login"):
+            state.trains = []
+            state.picked = set()
+            state.cursor = 0
+            state.result = ""
+            _note(state, app, "", "idle")
         else:
             state.stop.set()
             event.app.exit()

@@ -207,6 +207,36 @@ def test_hangul_keys_work_as_shortcuts():
     assert seen["after_b"] == "dash", f"ㅂ 로 뒤로가기가 안 됨: {seen}"
 
 
+def test_cancel_backs_out_instead_of_quitting():
+    """조회 후 취소하면 프로그램이 끝나는 게 아니라 대시보드로 돌아와야 한다."""
+    fake_keyring()
+    state = tui.State("KTX")
+    state.phase = "picking"
+    state.trains = [FakeTrain(), FakeTrain()]
+    state.picked = {0}
+
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            app = tui.build_app(state)
+            seen = {}
+
+            def drive():
+                time.sleep(0.2)
+                pipe.send_text("q")           # 취소
+                time.sleep(0.3)
+                seen["after_cancel"] = (state.phase, len(state.trains), app.is_running)
+                pipe.send_text("q")           # 이제서야 종료
+
+            threading.Thread(target=drive, daemon=True).start()
+            app.run()
+
+    phase, n_trains, alive = seen["after_cancel"]
+    assert alive, "취소만 했는데 앱이 죽었다"
+    assert phase == "idle", f"대시보드로 안 돌아옴: {phase}"
+    assert n_trains == 0, "취소했는데 열차 목록이 남아 있다"
+    assert state.picked == set()
+
+
 def test_function_keys_bypass_ime():
     """IME 가 자모를 물고 있어도 F키/Esc 는 그대로 도착해야 한다."""
     fake_keyring()
