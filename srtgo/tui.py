@@ -1,16 +1,17 @@
 """전체화면 대시보드 UI.
 
 조건, 대상 열차, 대기 상태를 한 화면에 두고 Enter 로 굴린다.
-예매 로직은 srtgo.py 것을 그대로 쓰고, 설정 입력도 기존 inquirer 함수를
-run_in_terminal 으로 잠깐 내려가서 재사용한다. 여기서 새로 만드는 건 화면뿐.
+조건과 설정도 이 안에서 고친다(e / s). 예매 로직만 srtgo.py 것을 그대로 쓰고
+keyring 키도 같아서, --classic 메뉴와 설정을 공유한다.
 """
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from random import gammavariate
 
-from prompt_toolkit.application import Application, run_in_terminal
+from prompt_toolkit.application import Application
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
@@ -86,6 +87,18 @@ class State:
         self.result = ""
         self.stop = threading.Event()
         self.pause = threading.Event()
+        # 화면 전환: dash(대시보드) / form(항목 목록) / pick(값 고르기) / edit(문자 입력)
+        self.screen = "dash"
+        self.form_title = ""
+        self.fields = []
+        self.fcur = 0
+        self.pick_opts = []
+        self.pick_cur = 0
+        self.pick_sel = set()
+        self.pick_multi = False
+        self.pick_field = None
+        self.buf = ""
+        self.notice = ""
 
     # --- 저장된 조건 (srtgo.py 와 같은 keyring 키를 읽고 쓴다) ---
     def get(self, key, default=""):
@@ -174,6 +187,16 @@ def render(state):
         out.extend(parts)
         out.append(("", "\n"))
 
+    if state.screen == "pick":
+        render_pick(state, line)
+        return out
+    if state.screen == "form":
+        render_form(state, line)
+        return out
+    if state.screen == "edit":
+        render_edit(state, line)
+        return out
+
     def field(label, value, style="class:value"):
         return [("class:label", f"  {label}  "), (style, pad(str(value), 21))]
 
@@ -246,6 +269,293 @@ def render(state):
         parts += [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
     line(*parts)
     return out
+
+
+
+# --------------------------------------------------------------------------
+# 항목 편집 (조건 / 설정)
+
+
+SEAT_CHOICES = [
+    ("일반실 우선", "GENERAL_FIRST"),
+    ("일반실만", "GENERAL_ONLY"),
+    ("특실 우선", "SPECIAL_FIRST"),
+    ("특실만", "SPECIAL_ONLY"),
+]
+
+OPTION_CHOICES = [
+    ("어린이", "child"),
+    ("경로우대", "senior"),
+    ("중증장애인", "disability1to3"),
+    ("경증장애인", "disability4to6"),
+    ("KTX만", "ktx"),
+]
+
+
+class Field:
+    """keyring 값 하나를 화면에서 고치기 위한 항목.
+
+    kind: pick(하나 고르기) / multi(여러 개) / num(증감) / text(입력) / bool(토글)
+    """
+
+    def __init__(self, service, key, label, kind, choices=None, default="",
+                 lo=0, hi=9, step=1, mask=False, note=""):
+        self.service = service
+        self.key = key
+        self.label = label
+        self.kind = kind
+        self.choices = choices or []
+        self.default = default
+        self.lo, self.hi, self.step = lo, hi, step
+        self.mask = mask
+        self.note = note
+
+    def raw(self):
+        return core.keyring.get_password(self.service, self.key) or self.default
+
+    def save(self, value):
+        core.keyring.set_password(self.service, self.key, str(value))
+
+    def display(self):
+        raw = self.raw()
+        if self.kind == "bool":
+            return "예" if raw == "1" else "아니오"
+        if self.kind == "text":
+            if not raw:
+                return "(없음)"
+            if self.mask == "tail":  # 카드번호: 뒤 4자리만
+                return "*" * max(0, len(raw) - 4) + raw[-4:]
+            return "*" * len(raw) if self.mask else raw
+        if self.kind == "multi":
+            picked = [v for v in raw.split(",") if v]
+            labels = [lab for lab, val in self.choices if val in picked]
+            return ", ".join(labels) if labels else "(없음)"
+        if self.kind == "pick":
+            for lab, val in self.choices:
+                if val == raw:
+                    return lab
+            return raw or "(없음)"
+        return raw
+
+    def nudge(self, delta):
+        """좌우키로 바로 바꿀 수 있는 것들."""
+        if self.kind == "bool":
+            self.save("0" if self.raw() == "1" else "1")
+            return True
+        if self.kind == "num":
+            try:
+                cur = float(self.raw() or self.lo)
+            except ValueError:
+                cur = self.lo
+            cur = min(max(cur + delta * self.step, self.lo), self.hi)
+            self.save(f"{cur:g}")
+            return True
+        if self.kind == "pick" and self.choices:
+            values = [v for _, v in self.choices]
+            try:
+                i = values.index(self.raw())
+            except ValueError:
+                i = 0
+            self.save(values[(i + delta) % len(values)])
+            return True
+        return False
+
+
+def _saved_stations(rail_type):
+    return [(n, n) for n in core.get_station(rail_type)[1]]
+
+
+def _all_stations(rail_type):
+    return [(n, n) for n in core.STATIONS[rail_type]]
+
+
+def _date_choices(rail_type):
+    now = datetime.now() + timedelta(minutes=10)
+    span = (30 if rail_type == "SRT" else 31) - (0 if now.hour >= 7 else 1)
+    out = []
+    for i in range(span + 1):
+        d = now + timedelta(days=i)
+        out.append((d.strftime("%m/%d ") + "월화수목금토일"[d.weekday()],
+                    d.strftime("%Y%m%d")))
+    return out
+
+
+def condition_fields(state):
+    rt = state.rail_type
+    stations = _saved_stations(rt)
+    dates = _date_choices(rt)
+    fields = [
+        Field(rt, "departure", "출발역", "pick", stations,
+              default=stations[0][1] if stations else ""),
+        Field(rt, "arrival", "도착역", "pick", stations,
+              default=stations[-1][1] if stations else ""),
+        Field(rt, "date", "출발 날짜", "pick", dates, default=dates[0][1]),
+        Field(rt, "time", "이 시각 이후", "pick",
+              [(f"{h:02d}시", f"{h:02d}0000") for h in range(24)], default="120000"),
+        Field(rt, "adult", "어른", "num", default="1", lo=0, hi=9),
+    ]
+    for key in ("child", "senior", "disability1to3", "disability4to6"):
+        if key in core.get_options():
+            fields.append(Field(rt, key, core.PASSENGER_LABEL[key], "num",
+                                default="0", lo=0, hi=9))
+    fields += [
+        Field(rt, "seat_type", "좌석 종류", "pick", SEAT_CHOICES,
+              default="GENERAL_FIRST"),
+        Field(rt, "pay", "카드 결제", "bool", default="0"),
+    ]
+    return fields
+
+
+def setting_fields(state):
+    rt = state.rail_type
+    return [
+        Field(rt, "id", f"{rt} 아이디", "text",
+              note="멤버십 번호 / 이메일 / 전화번호(하이픈 포함)"),
+        Field(rt, "pass", f"{rt} 비밀번호", "text", mask=True),
+        Field("card", "number", "카드번호", "text", mask="tail", note="하이픈 없이"),
+        Field("card", "password", "카드 비밀번호", "text", mask=True, note="앞 2자리"),
+        Field("card", "birthday", "생년월일", "text", note="YYMMDD 또는 사업자번호"),
+        Field("card", "expire", "카드 유효기간", "text", note="YYMM"),
+        Field(rt, "station", "역 목록", "multi", _all_stations(rt),
+              note="Space 로 여러 개 선택. 여기 고른 역만 조건 화면에 나온다"),
+        Field("SRT", "options", "예매 옵션", "multi", OPTION_CHOICES),
+        Field("SRT", "interval", "조회 간격(초)", "num",
+              default=f"{core.RESERVE_INTERVAL_DEFAULT:g}",
+              lo=core.RESERVE_INTERVAL_RANGE[0], hi=core.RESERVE_INTERVAL_RANGE[1],
+              step=0.5, note="짧을수록 빨리 잡지만 차단 위험이 커짐"),
+        Field("telegram", "token", "텔레그램 token", "text", mask=True),
+        Field("telegram", "chat_id", "텔레그램 chat_id", "text"),
+    ]
+
+
+def after_save(state, field):
+    """저장 뒤 따라와야 하는 것들 (ok 플래그, 세션 무효화)."""
+    if field.service == state.rail_type and field.key in ("id", "pass"):
+        state.rail = None
+        state.user = ""
+        core.keyring.set_password(state.rail_type, "ok", "1")
+    elif field.service == "card":
+        done = all(core.keyring.get_password("card", k)
+                   for k in ("number", "password", "birthday", "expire"))
+        core.keyring.set_password("card", "ok", "1" if done else "0")
+    elif field.service == "telegram":
+        done = all(core.keyring.get_password("telegram", k)
+                   for k in ("token", "chat_id"))
+        core.keyring.set_password("telegram", "ok", "1" if done else "0")
+    elif field.key == "station":
+        # 역 목록이 줄면 저장된 출발/도착역이 목록 밖으로 나갈 수 있다.
+        names = [n for n in (field.raw() or "").split(",") if n]
+        for key in ("departure", "arrival"):
+            if names and core.keyring.get_password(state.rail_type, key) not in names:
+                core.keyring.set_password(state.rail_type, key, names[0])
+
+
+def open_form(state, title, fields):
+    state.screen = "form"
+    state.form_title = title
+    state.fields = fields
+    state.fcur = 0
+    state.notice = ""
+
+
+def open_picker(state, field):
+    state.pick_field = field
+    state.pick_opts = field.choices
+    state.pick_multi = field.kind == "multi"
+    raw = field.raw()
+    if state.pick_multi:
+        chosen = {v for v in raw.split(",") if v}
+        state.pick_sel = {i for i, (_, v) in enumerate(field.choices) if v in chosen}
+        state.pick_cur = min(state.pick_sel, default=0)
+    else:
+        state.pick_sel = set()
+        state.pick_cur = next(
+            (i for i, (_, v) in enumerate(field.choices) if v == raw), 0)
+    state.screen = "pick"
+
+
+def commit_picker(state):
+    field = state.pick_field
+    if state.pick_multi:
+        values = [field.choices[i][1] for i in sorted(state.pick_sel)]
+        field.save(",".join(values))
+    else:
+        field.save(field.choices[state.pick_cur][1])
+    after_save(state, field)
+    state.screen = "form"
+
+
+PICK_ROWS = 12
+
+
+def render_pick(state, line):
+    field = state.pick_field
+    line(("class:title", " " + pad(field.label, WIDTH - 1)))
+    line()
+    total = len(state.pick_opts)
+    top = max(0, min(state.pick_cur - PICK_ROWS // 2, total - PICK_ROWS))
+    for i in range(top, min(top + PICK_ROWS, total)):
+        label = state.pick_opts[i][0]
+        if state.pick_multi:
+            mark = "[*]" if i in state.pick_sel else "[ ]"
+        else:
+            mark = " > " if i == state.pick_cur else "   "
+        style = "class:cursor" if i == state.pick_cur else (
+            "class:picked" if i in state.pick_sel else "")
+        line((style, pad(f" {mark} {label}", WIDTH)))
+    if total > PICK_ROWS:
+        line(("class:dim", f"  {state.pick_cur + 1}/{total}"))
+    line()
+    hints = ([("up/dn", "이동"), ("Space", "선택"), ("Enter", "완료"), ("Esc", "취소")]
+             if state.pick_multi else
+             [("up/dn", "이동"), ("Enter", "선택"), ("Esc", "취소")])
+    parts = []
+    for key, desc in hints:
+        parts += [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
+    line(*parts)
+
+
+def render_form(state, line):
+    line(("class:title", " " + pad(state.form_title, WIDTH - 1)))
+    line()
+    for i, field in enumerate(state.fields):
+        style = "class:cursor" if i == state.fcur else ""
+        arrow = ">" if i == state.fcur else " "
+        row = f" {arrow} {pad(field.label, 21)}{field.display()}"
+        line((style, pad(row, WIDTH)))
+    line()
+    field = state.fields[state.fcur] if state.fields else None
+    if field and field.note:
+        line(("class:dim", f"  {field.note}"))
+    if state.notice:
+        line(("class:warn", f"  {state.notice}"))
+    line()
+    kind = field.kind if field else ""
+    parts = [("class:key", "  [up/dn]"), ("class:label", " 이동")]
+    if kind in ("num", "bool"):
+        parts += [("class:key", "  [<-/->]"), ("class:label", " 조절")]
+    elif kind == "pick":
+        parts += [("class:key", "  [<-/->]"), ("class:label", " 조절"),
+                  ("class:key", "  [Enter]"), ("class:label", " 목록")]
+    elif kind in ("text", "multi"):
+        parts += [("class:key", "  [Enter]"),
+                  ("class:label", " 입력" if kind == "text" else " 목록")]
+    parts += [("class:key", "  [Esc]"), ("class:label", " 돌아가기")]
+    line(*parts)
+
+
+def render_edit(state, line):
+    field = state.fields[state.fcur]
+    line(("class:title", " " + pad(field.label, WIDTH - 1)))
+    line()
+    shown = "*" * len(state.buf) if field.mask else state.buf
+    line(("class:label", "  "), ("class:value", pad(shown + "_", WIDTH - 2)))
+    line()
+    if field.note:
+        line(("class:dim", f"  {field.note}"))
+    line()
+    line(("class:key", "  [Enter]"), ("class:label", " 저장"),
+         ("class:key", "  [Esc]"), ("class:label", " 취소"))
 
 
 # --------------------------------------------------------------------------
@@ -395,20 +705,82 @@ def build_app(state):
         refresh_interval=0.5,
     )
 
-    @kb.add("q")
-    @kb.add("c-c")
+    def field():
+        return state.fields[state.fcur] if state.fields else None
+
+    def move(delta):
+        """현재 화면의 커서 이동."""
+        if state.screen == "pick" and state.pick_opts:
+            state.pick_cur = (state.pick_cur + delta) % len(state.pick_opts)
+        elif state.screen == "form" and state.fields:
+            state.fcur = (state.fcur + delta) % len(state.fields)
+            state.notice = ""
+        elif state.screen == "dash" and state.trains:
+            state.cursor = (state.cursor + delta) % len(state.trains)
+
+    @kb.add("up")
     def _(event):
-        if state.phase in ("running", "paused"):
-            state.stop.set()
-            state.pause.clear()
-            _note(state, app, "중지됨", "idle")
-            state.stop = threading.Event()
-        else:
-            state.stop.set()
-            event.app.exit()
+        move(-1)
+
+    @kb.add("down")
+    def _(event):
+        move(1)
+
+    @kb.add("left")
+    def _(event):
+        if state.screen == "form" and field():
+            field().nudge(-1)
+            after_save(state, field())
+
+    @kb.add("right")
+    def _(event):
+        if state.screen == "form" and field():
+            field().nudge(1)
+            after_save(state, field())
+
+    @kb.add("escape", eager=True)
+    def _(event):
+        if state.screen == "edit":
+            state.screen = "form"
+        elif state.screen == "pick":
+            state.screen = "form"
+        elif state.screen == "form":
+            state.screen = "dash"
+            state.fields = []
+
+    @kb.add("space")
+    def _(event):
+        if state.screen == "pick" and state.pick_multi:
+            state.pick_sel ^= {state.pick_cur}
+        elif state.screen == "dash" and state.phase == "picking" and state.trains:
+            state.picked ^= {state.cursor}
+        elif state.screen == "edit":
+            state.buf += " "
 
     @kb.add("enter")
     def _(event):
+        if state.screen == "pick":
+            commit_picker(state)
+            return
+        if state.screen == "edit":
+            field().save(state.buf)
+            after_save(state, field())
+            state.screen = "form"
+            return
+        if state.screen == "form":
+            current = field()
+            if current is None:
+                return
+            if current.kind in ("pick", "multi"):
+                open_picker(state, current)
+            elif current.kind == "text":
+                state.buf = current.raw()
+                state.screen = "edit"
+            else:
+                current.nudge(1)
+                after_save(state, current)
+            return
+        # 대시보드
         if state.phase in ("idle", "error"):
             _spawn(do_search, state, app)
         elif state.phase == "picking":
@@ -421,42 +793,77 @@ def build_app(state):
             state.trains = []
             state.phase = "idle"
 
-    @kb.add("r")
+    @kb.add("backspace")
     def _(event):
-        if state.phase in ("picking", "idle", "error"):
-            _spawn(do_search, state, app)
+        if state.screen == "edit":
+            state.buf = state.buf[:-1]
 
-    @kb.add("up")
+    @kb.add("<any>")
     def _(event):
-        if state.trains:
-            state.cursor = (state.cursor - 1) % len(state.trains)
+        """문자 입력 화면에서만 글자를 받는다. 나머지 화면의 단축키는 아래에서 처리."""
+        if state.screen != "edit":
+            return
+        text = event.data
+        if text and text.isprintable():
+            state.buf += text
 
-    @kb.add("down")
-    def _(event):
-        if state.trains:
-            state.cursor = (state.cursor + 1) % len(state.trains)
+    typing = Condition(lambda: state.screen == "edit")
+    not_typing = ~typing
 
-    @kb.add("space")
-    def _(event):
-        if state.phase == "picking" and state.trains:
-            state.picked ^= {state.cursor}
+    def shortcut(key, handler):
+        @kb.add(key, filter=not_typing)
+        def _(event):
+            if state.screen == "dash":
+                handler(event)
 
-    @kb.add("p")
+    def on_q(event):
+        if state.phase in ("running", "paused"):
+            state.stop.set()
+            state.pause.clear()
+            _note(state, app, "중지됨", "idle")
+            state.stop = threading.Event()
+        else:
+            state.stop.set()
+            event.app.exit()
+
+    @kb.add("q", filter=not_typing)
+    @kb.add("c-c")
     def _(event):
+        if state.screen == "edit":
+            state.screen = "form"  # c-c 는 입력 취소
+            return
+        if state.screen in ("form", "pick"):
+            state.screen = "form" if state.screen == "pick" else "dash"
+            return
+        on_q(event)
+
+    shortcut("r", lambda event: (
+        _spawn(do_search, state, app)
+        if state.phase in ("picking", "idle", "error") else None))
+
+    def on_p(event):
         if state.phase == "running":
             state.pause.set()
         elif state.phase == "paused":
             state.pause.clear()
 
-    @kb.add("e")
-    def _(event):
+    shortcut("p", on_p)
+
+    def on_e(event):
         if state.phase in ("running", "paused"):
             return
-        run_in_terminal(lambda: core.edit_conditions(state.rail_type))
+        open_form(state, "예매 조건", condition_fields(state))
 
-    @kb.add("t")
-    def _(event):
-        """SRT <-> KTX 전환."""
+    shortcut("e", on_e)
+
+    def on_s(event):
+        if state.phase in ("running", "paused"):
+            return
+        open_form(state, "설정", setting_fields(state))
+
+    shortcut("s", on_s)
+
+    def on_t(event):
         if state.phase in ("running", "paused"):
             return
         state.rail_type = "SRT" if state.rail_type == "KTX" else "KTX"
@@ -467,17 +874,7 @@ def build_app(state):
         state.picked = set()
         _note(state, app, f"{state.rail_type} 로 전환", "idle")
 
-    @kb.add("s")
-    def _(event):
-        if state.phase in ("running", "paused"):
-            return
-
-        def go():
-            changed = core.settings_menu(state.rail_type, state.debug)
-            if changed == "login":
-                state.rail = None
-                state.user = ""
-        run_in_terminal(go)
+    shortcut("t", on_t)
 
     threading.Thread(target=_tick, args=(app, state), daemon=True).start()
     return app
