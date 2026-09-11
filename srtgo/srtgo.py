@@ -850,13 +850,6 @@ PASSENGER_LABEL = {
     "disability4to6": "경증장애",
 }
 
-ANSI_RE = re.compile(r"\[[0-9;]*m")
-
-
-def strip_color(text: str) -> str:
-    return ANSI_RE.sub("", text)
-
-
 def get_interval() -> float:
     """저장된 조회 간격(평균 초). 없거나 망가졌으면 기본값."""
     try:

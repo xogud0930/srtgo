@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 from random import gammavariate
 
 from prompt_toolkit.application import Application
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, Window
@@ -29,6 +30,7 @@ STYLE = Style.from_dict({
     "ok": "bold #00d700",
     "warn": "bold #ffaf00",
     "err": "bold #ff5f5f",
+    "sold": "#8a5f5f",
     "dim": "#6c6c6c",
     "cursor": "bold #ffffff bg:#5f5faf",
     "picked": "bold #00d700",
@@ -73,7 +75,19 @@ def key_aliases(key):
         keys.append(fkey)
     return keys
 
-WIDTH = 62  # 화면 폭(칸). 한글은 2칸이라 len() 이 아니라 get_cwidth() 로 센다.
+# 화면 폭(칸). 한글은 2칸이라 len() 이 아니라 get_cwidth() 로 센다.
+# 고정 폭으로 그리면 터미널이 그보다 좁을 때 줄이 접히고, 접힌 만큼 화면 계산이
+# 어긋나 이전 프레임이 지워지지 않고 남는다. 매 렌더마다 실제 폭을 본다.
+WIDTH = 72          # 넓은 터미널에서도 이 이상으로는 안 늘린다
+MIN_WIDTH = 44
+
+
+def width():
+    try:
+        columns = get_app().output.get_size().columns
+    except Exception:      # 앱 밖에서 렌더할 때 (테스트 등)
+        columns = WIDTH + 1
+    return max(MIN_WIDTH, min(columns - 1, WIDTH))
 
 
 def pad(text, width):
@@ -85,17 +99,30 @@ def rpad(text, width):
     return " " * max(0, width - get_cwidth(text)) + text
 
 
+def clip(text, width):
+    """표시 폭 기준으로 자른다. len() 으로 자르면 한글에서 어긋난다."""
+    if get_cwidth(text) <= width:
+        return text
+    out = ""
+    for ch in text:
+        if get_cwidth(out + ch) > width:
+            break
+        out += ch
+    return out
+
+
 def emit_hints(line, hints):
     """[키] 설명 목록을 화면 폭에 맞춰 접어서 출력."""
-    parts, width = [], 0
+    limit = width()
+    parts, used = [], 0
     for key, desc in hints:
         chunk = [("class:key", f"  [{key}]"), ("class:label", f" {desc}")]
         size = get_cwidth(f"  [{key}] {desc}")
-        if parts and width + size > WIDTH:
+        if parts and used + size > limit:
             line(*parts)
-            parts, width = [], 0
+            parts, used = [], 0
         parts += chunk
-        width += size
+        used += size
     if parts:
         line(*parts)
 
@@ -107,7 +134,7 @@ def rule(title):
     한국어 터미널에서 2칸으로 그려져 정렬이 깨진다. 그래서 ASCII 만 쓴다.
     """
     head = f"-- {title} "
-    return head + "-" * max(0, WIDTH - get_cwidth(head))
+    return head + "-" * max(0, width() - get_cwidth(head))
 
 
 class State:
@@ -220,11 +247,67 @@ def _date_label(state):
     return d.strftime("%m/%d ") + "월화수목금토일"[d.weekday()]
 
 
+def seat_status(train, rail_type):
+    """(일반, 특실, 예약대기) 가용 여부. 대기가 없는 열차면 None."""
+    if rail_type == "SRT":
+        return (train.general_seat_available(),
+                train.special_seat_available(),
+                train.reserve_standby_available() or None)
+    waiting = None
+    if getattr(train, "wait_reserve_flag", -1) >= 0:
+        waiting = train.has_general_waiting_list()
+    return train.has_general_seat(), train.has_special_seat(), waiting
+
+
+def train_row(state, index, train):
+    """한 줄을 조각으로 만든다. 가능/매진에만 색이 붙도록.
+
+    행 전체에 배경색을 깔면 안쪽 색이 묻혀서, 커서는 왼쪽 > 로 표시한다.
+    """
+    name = getattr(train, "train_type_name", None) or getattr(train, "train_name", "")
+    number = getattr(train, "train_no", None) or getattr(train, "train_number", "")
+    dep, arr = train.dep_time, train.arr_time
+    times = f"{dep[:2]}:{dep[2:4]}~{arr[:2]}:{arr[2:4]}"
+
+    limit = width()
+    # 좁으면 열차번호 칸을 버려서 일반/특실 배지 자리를 먼저 확보한다.
+    # 시각이 같이 나오므로 번호가 없어도 어느 열차인지 헷갈리지 않는다.
+    wide = limit >= 62
+    head = " > " if index == state.cursor else "   "
+    head += "[*] " if index in state.picked else "[ ] "
+    head += pad(clip(str(name), 10), 11)
+    if wide:
+        head += pad(str(number), 5)
+    head += times
+
+    head_col = 36 if wide else 30
+    style = "class:value" if index == state.cursor else "class:dim"
+    row = [(style, pad(head, head_col))]
+    used = max(head_col, get_cwidth(head))
+    for label, ok in zip(("일반", "특실", "대기"),
+                         seat_status(train, state.rail_type)):
+        if ok is None:
+            continue
+        badge = f"{label} " + ("가능" if ok else "매진")
+        if used + get_cwidth(badge) + 2 > limit:
+            break          # 좁으면 뒤쪽 배지(대기)부터 버린다
+        row.append(("class:label", f"{label} "))
+        row.append(("class:ok" if ok else "class:sold",
+                    pad("가능" if ok else "매진", 6)))
+        used += get_cwidth(badge) + 2
+    return row
+
+
 def render(state):
     out = []
 
     def line(*parts):
+        # 줄 끝까지 공백으로 채운다. 짧게 끝내면 이전 프레임의 글자가 그 자리에
+        # 그대로 남는다 (구분선 꼬리가 열차 행 끝에 붙어 보이던 증상).
         out.extend(parts)
+        filled = sum(get_cwidth(text) for _, text in parts)
+        if filled < width():
+            out.append(("", " " * (width() - filled)))
         out.append(("", "\n"))
 
     if state.screen == "pick":
@@ -240,36 +323,42 @@ def render(state):
     def field(label, value, style="class:value"):
         return [("class:label", f"  {label}  "), (style, pad(str(value), 21))]
 
+    def field_row(*pairs):
+        """넓으면 두 칸, 좁으면 한 칸씩."""
+        if width() >= 62:
+            parts = []
+            for label, value in pairs:
+                parts += field(label, value)
+            line(*parts)
+        else:
+            for label, value in pairs:
+                line(*field(label, value))
+
     who = f"{state.rail_type} | {state.user}" if state.user else state.rail_type
-    line(("class:title", " srtgo " + rpad(who + " ", WIDTH - 7)))
+    line(("class:title", " srtgo " + rpad(who + " ", width() - 7)))
     line()
 
     if not state.ready():
-        line(("class:warn", "  조건이 비어 있습니다. "),
-             ("class:key", "e"), ("class:warn", " 를 눌러 구간과 날짜를 정하세요."))
+        line(("class:warn", clip("  조건이 비어 있습니다. e 를 눌러 정하세요.",
+                                 width())))
         line()
     else:
-        line(*field("구간", f"{state.get('departure')} -> {state.get('arrival')}"),
-             *field("날짜", _date_label(state)))
-        line(*field("시각", f"{state.get('time', '000000')[:2]}시 이후"),
-             *field("승객", ", ".join(f"{core.PASSENGER_LABEL.get(k, k)} {v}"
-                                      for k, v in state.counts().items())))
-        line(*field("좌석", _seat_label(state)),
-             *field("결제", "카드 자동" if state.get("pay") == "1" else "안 함"))
+        field_row(("구간", f"{state.get('departure')} -> {state.get('arrival')}"),
+                  ("날짜", _date_label(state)))
+        field_row(("시각", f"{state.get('time', '000000')[:2]}시 이후"),
+                  ("승객", ", ".join(f"{core.PASSENGER_LABEL.get(k, k)} {v}"
+                                     for k, v in state.counts().items())))
+        field_row(("좌석", _seat_label(state)),
+                  ("결제", "카드 자동" if state.get("pay") == "1" else "안 함"))
         line()
 
     # 대상 열차
     line(("class:head", rule("대상 열차")))
     if not state.trains:
-        line(("class:dim", "  조회 전입니다. "), ("class:key", "Enter"),
-             ("class:dim", " 를 누르면 열차를 가져옵니다."))
+        line(("class:dim", clip("  Enter 를 누르면 열차를 조회합니다.", width())))
     else:
         for i, train in enumerate(state.trains):
-            mark = "[*]" if i in state.picked else "[ ]"
-            style = "class:cursor" if i == state.cursor else (
-                "class:picked" if i in state.picked else "")
-            text = f" {mark} {core.strip_color(str(train))}"
-            line((style, pad(text, WIDTH)))
+            line(*train_row(state, i, train))
     line()
 
     # 상태
@@ -278,19 +367,28 @@ def render(state):
     if state.phase in ("running", "paused"):
         elapsed = time.time() - (state.started_at or time.time())
         spin = SPINNER[state.attempts & 3] if state.phase == "running" else " "
-        line(("class:label", "  "), (f"class:{style}", f"{label} {spin}"),
-             ("class:label", "   시도 "), ("class:value", f"{state.attempts}회"),
-             ("class:label", "   경과 "), ("class:value", _fmt_elapsed(elapsed)),
-             ("class:label", "   간격 "), ("class:value", f"{core.get_interval()}초"))
+        stats = [("class:label", "   시도 "),
+                 ("class:value", f"{state.attempts}회"),
+                 ("class:label", "   경과 "),
+                 ("class:value", _fmt_elapsed(elapsed)),
+                 ("class:label", "   간격 "),
+                 ("class:value", f"{core.get_interval()}초")]
+        header = [("class:label", "  "), (f"class:{style}", f"{label} {spin}")]
+        if sum(get_cwidth(t) for _, t in header + stats) <= width():
+            line(*(header + stats))
+        else:
+            line(*header)
+            line(*stats)
     else:
         line(("class:label", "  "), (f"class:{style}", label))
 
     if state.last_msg:
+        head = f"  마지막  {state.last_at}  "
         line(("class:label", "  마지막  "), ("class:dim", f"{state.last_at}  "),
-             ("class:value", state.last_msg[:52]))
+             ("class:value", clip(state.last_msg, max(0, width() - len(head)))))
     if state.result:
         for row in state.result.split("\n"):
-            line(("class:ok", f"  {row[:60]}"))
+            line(("class:ok", clip(f"  {row}", width())))
     line()
 
     # 키 안내
@@ -528,7 +626,7 @@ PICK_ROWS = 12
 
 def render_pick(state, line):
     field = state.pick_field
-    line(("class:title", " " + pad(field.label, WIDTH - 1)))
+    line(("class:title", " " + pad(field.label, width() - 1)))
     line()
     total = len(state.pick_opts)
     top = max(0, min(state.pick_cur - PICK_ROWS // 2, total - PICK_ROWS))
@@ -540,7 +638,7 @@ def render_pick(state, line):
             mark = " > " if i == state.pick_cur else "   "
         style = "class:cursor" if i == state.pick_cur else (
             "class:picked" if i in state.pick_sel else "")
-        line((style, pad(f" {mark} {label}", WIDTH)))
+        line((style, pad(clip(f" {mark} {label}", width()), width())))
     if total > PICK_ROWS:
         line(("class:dim", f"  {state.pick_cur + 1}/{total}"))
     line()
@@ -551,19 +649,19 @@ def render_pick(state, line):
 
 
 def render_form(state, line):
-    line(("class:title", " " + pad(state.form_title, WIDTH - 1)))
+    line(("class:title", " " + pad(state.form_title, width() - 1)))
     line()
     for i, field in enumerate(state.fields):
         style = "class:cursor" if i == state.fcur else ""
         arrow = ">" if i == state.fcur else " "
-        row = f" {arrow} {pad(field.label, 21)}{field.display()}"
-        line((style, pad(row, WIDTH)))
+        row = f" {arrow} {pad(clip(field.label, 21), 21)}{field.display()}"
+        line((style, pad(clip(row, width()), width())))
     line()
     field = state.fields[state.fcur] if state.fields else None
     if field and field.note:
-        line(("class:dim", f"  {field.note}"))
+        line(("class:dim", clip(f"  {field.note}", width())))
     if state.notice:
-        line(("class:warn", f"  {state.notice}"))
+        line(("class:warn", clip(f"  {state.notice}", width())))
     line()
     kind = field.kind if field else ""
     parts = [("class:key", "  [up/dn]"), ("class:label", " 이동")]
@@ -581,13 +679,13 @@ def render_form(state, line):
 
 def render_edit(state, line):
     field = state.fields[state.fcur]
-    line(("class:title", " " + pad(field.label, WIDTH - 1)))
+    line(("class:title", " " + pad(field.label, width() - 1)))
     line()
     shown = "*" * len(state.buf) if field.mask else state.buf
-    line(("class:label", "  "), ("class:value", pad(shown + "_", WIDTH - 2)))
+    line(("class:label", "  "), ("class:value", pad(shown + "_", width() - 2)))
     line()
     if field.note:
-        line(("class:dim", f"  {field.note}"))
+        line(("class:dim", clip(f"  {field.note}", width())))
     line()
     line(("class:key", "  [Enter]"), ("class:label", " 저장"),
          ("class:key", "  [Esc]"), ("class:label", " 취소"))

@@ -59,8 +59,26 @@ def fake_keyring(seed=None):
 
 
 class FakeTrain:
+    """srtgo.ktx.Train 에서 화면이 실제로 읽는 것만 흉내낸다."""
+
+    def __init__(self, name="KTX-이음", no="751", dep="092000", arr="100500",
+                 general=True, special=False, waiting=None):
+        self.train_type_name, self.train_no = name, no
+        self.dep_time, self.arr_time = dep, arr
+        self._general, self._special = general, special
+        self.wait_reserve_flag = -1 if waiting is None else (9 if waiting else 0)
+
+    def has_general_seat(self):
+        return self._general
+
+    def has_special_seat(self):
+        return self._special
+
+    def has_general_waiting_list(self):
+        return self.wait_reserve_flag == 9
+
     def __str__(self):
-        return "[KTX-이음 751] 09/25 09:20~10:05 포항~영덕 특실 예약가능"
+        return f"[{self.train_type_name} {self.train_no}]"
 
 
 def widest(state):
@@ -98,6 +116,90 @@ def test_every_screen_fits_width():
     state.fcur = 0
     state.buf = "x" * 40
     assert widest(state) <= tui.WIDTH + 2, "입력 화면이 폭을 넘음"
+
+
+def test_availability_is_spelled_out_per_row():
+    """행마다 일반/특실 가능·매진이 보이고, 대기는 있을 때만 나와야 한다."""
+    fake_keyring()
+    state = tui.State("KTX")
+    state.phase = "picking"
+    state.trains = [
+        FakeTrain(general=True, special=False),
+        FakeTrain(name="ITX-마음", no="1801", general=False, special=False,
+                  waiting=True),
+    ]
+
+    rows = [tui.train_row(state, i, t) for i, t in enumerate(state.trains)]
+    first = "".join(text for _, text in rows[0])
+    second = "".join(text for _, text in rows[1])
+
+    assert "일반 가능" in first and "특실 매진" in first, first
+    assert "대기" not in first, "대기가 없는 열차인데 표시됨"
+    assert "대기 가능" in second, second
+
+    # 가능/매진이 서로 다른 스타일이어야 눈에 띈다
+    styles = {text.strip(): style for style, text in rows[0]}
+    assert styles["가능"] != styles["매진"], styles
+
+
+def test_narrow_terminal_does_not_overflow():
+    """터미널이 좁으면 줄이 접히고, 접힌 만큼 화면 계산이 어긋나 잔상이 남는다.
+
+    어떤 폭에서도 줄이 그 폭을 넘지 않아야 한다.
+    """
+    fake_keyring()
+    original = tui.width
+    try:
+        for columns in (44, 52, 62, 72):
+            tui.width = lambda c=columns: c
+            state = tui.State("KTX")
+            state.user = "홍길동"
+            state.phase = "picking"
+            state.trains = [
+                FakeTrain(general=True, special=False, waiting=True),
+                FakeTrain(name="ITX-새마을", no="1021", general=False,
+                          special=True, waiting=False),
+            ]
+            state.picked = {0}
+            assert widest(state) <= columns, f"{columns}칸에서 넘침"
+
+            tui.open_form(state, "설정", tui.setting_fields(state))
+            for i in range(len(state.fields)):
+                state.fcur = i
+                assert widest(state) <= columns, f"{columns}칸 설정 {i}번째"
+
+            tui.open_picker(state, state.fields[6])
+            assert widest(state) <= columns, f"{columns}칸 목록"
+    finally:
+        tui.width = original
+
+
+def test_every_line_fills_the_width():
+    """줄이 짧게 끝나면 그 자리에 이전 프레임 글자가 남는다.
+
+    구분선 꼬리가 열차 행 끝에 붙어 보이던 잔상의 원인이라, 모든 줄이
+    화면 폭을 정확히 채워야 한다.
+    """
+    fake_keyring()
+    original = tui.width
+    try:
+        for columns in (50, 62, 72):
+            tui.width = lambda c=columns: c
+            state = tui.State("KTX")
+            state.user = "홍길동"
+            for phase in ("idle", "picking", "running", "done"):
+                state.phase = phase
+                state.trains = [] if phase == "idle" else [
+                    FakeTrain(general=True, special=False, waiting=True)]
+                state.picked = {0} if state.trains else set()
+                state.last_msg = "매진"
+                state.result = "예매 성공" if phase == "done" else ""
+                text = "".join(t for _, t in to_formatted_text(tui.render(state)))
+                widths = {get_cwidth(line)
+                          for line in text.split(chr(10))[:-1]}
+                assert widths == {columns}, f"{columns}칸 {phase}: {sorted(widths)}"
+    finally:
+        tui.width = original
 
 
 def test_card_number_is_masked():
