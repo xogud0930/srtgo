@@ -58,6 +58,36 @@ def fake_keyring(seed=None):
     return fake
 
 
+class FakeSeat:
+    def __init__(self, text):
+        self.text = text
+
+    def __str__(self):
+        return self.text
+
+
+class FakeItem:
+    """예약/발권 내역 한 건."""
+
+    def __init__(self, text, ticket=False, waiting=False, seats=()):
+        self.text = text
+        self.is_ticket = ticket
+        self.is_waiting = waiting
+        self.tickets = [FakeSeat(x) for x in seats]
+
+    def __str__(self):
+        return self.text
+
+
+RSV_ITEMS = [
+    FakeItem("[KTX 263] 09/22 11:02~13:13 광명~포항, 67500원(1석)",
+             ticket=True, seats=["13호차 10A (일반실) 어른"]),
+    FakeItem("[KTX-이음 751] 09/25 09:20~10:05 포항~영덕, 8400원(1석)",
+             seats=["7호차 3A (특실) 어른"]),
+    FakeItem("[ITX-마음 1814] 09/25 19:27~19:51 포항~영덕", waiting=True),
+]
+
+
 class FakeTrain:
     """srtgo.ktx.Train 에서 화면이 실제로 읽는 것만 흉내낸다."""
 
@@ -79,6 +109,13 @@ class FakeTrain:
 
     def __str__(self):
         return f"[{self.train_type_name} {self.train_no}]"
+
+
+class _DummyApp:
+    """invalidate 만 받아주는 껍데기."""
+
+    def invalidate(self):
+        pass
 
 
 def widest(state):
@@ -198,6 +235,52 @@ def test_every_line_fills_the_width():
                 widths = {get_cwidth(line)
                           for line in text.split(chr(10))[:-1]}
                 assert widths == {columns}, f"{columns}칸 {phase}: {sorted(widths)}"
+    finally:
+        tui.width = original
+
+
+def test_reservation_screen_tags_and_actions():
+    """발권/미결제/대기에 따라 꼬리표와 고를 수 있는 동작이 달라야 한다."""
+    fake_keyring()
+    state = tui.State("KTX")
+    state.screen = "rsv"
+    state.rsv_items = RSV_ITEMS
+
+    assert [tui.item_state(i)[0] for i in RSV_ITEMS] == ["발권", "미결제", "대기"]
+    assert [tui.item_state(i)[1] for i in RSV_ITEMS] == [False, True, False]
+
+    # 미결제 건에서만 결제하기가 나온다
+    state.rsv_cur = 1
+    tui.open_item_actions(state, _DummyApp())
+    labels = [label for label, _ in state.pick_opts]
+    assert labels == ["결제하기", "취소하기", "그만두기"], labels
+
+    # 발권된 건은 환불
+    state.screen = "rsv"
+    state.rsv_cur = 0
+    tui.open_item_actions(state, _DummyApp())
+    assert [label for label, _ in state.pick_opts] == ["환불하기", "그만두기"]
+
+    # 대기 건은 취소만
+    state.screen = "rsv"
+    state.rsv_cur = 2
+    tui.open_item_actions(state, _DummyApp())
+    assert [label for label, _ in state.pick_opts] == ["취소하기", "그만두기"]
+
+
+def test_reservation_screen_fits_width():
+    fake_keyring()
+    original = tui.width
+    try:
+        for columns in (44, 50, 62, 72):
+            tui.width = lambda c=columns: c
+            state = tui.State("KTX")
+            state.screen = "rsv"
+            state.rsv_items = RSV_ITEMS
+            state.rsv_cur = 1
+            text = "".join(t for _, t in to_formatted_text(tui.render(state)))
+            widths = {get_cwidth(line) for line in text.split(chr(10))[:-1]}
+            assert widths == {columns}, f"{columns}칸: {sorted(widths)}"
     finally:
         tui.width = original
 

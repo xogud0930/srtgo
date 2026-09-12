@@ -61,7 +61,8 @@ HANGUL_ALIAS = dict(zip(
 # IME 가 한글이면 자음 하나는 조합 버퍼에 남아 터미널까지 아예 안 온다.
 # 그래서 자모 별칭만으로는 부족하고, IME 를 타지 않는 키를 따로 준다.
 # 화살표/Enter/Space/Esc/F키/Ctrl 조합은 조합 대상이 아니라 항상 그대로 도착한다.
-FUNCTION_ALIAS = {"e": "f2", "s": "f3", "t": "f4", "r": "f5", "p": "f6"}
+FUNCTION_ALIAS = {"e": "f2", "s": "f3", "t": "f4", "r": "f5", "p": "f6",
+                  "l": "f7"}
 
 
 def key_aliases(key):
@@ -166,6 +167,10 @@ class State:
         self.pick_field = None
         self.buf = ""
         self.notice = ""
+        self.rsv_items = []
+        self.rsv_cur = 0
+        self.pick_title = ""
+        self.pick_commit = None
 
     # --- 저장된 조건 (srtgo.py 와 같은 keyring 키를 읽고 쓴다) ---
     def get(self, key, default=""):
@@ -319,6 +324,9 @@ def render(state):
     if state.screen == "edit":
         render_edit(state, line)
         return out
+    if state.screen == "rsv":
+        render_rsv(state, line)
+        return out
 
     def field(label, value, style="class:value"):
         return [("class:label", f"  {label}  "), (style, pad(str(value), 21))]
@@ -394,8 +402,8 @@ def render(state):
     # 키 안내
     # 한글 IME 가 켜져 있으면 영문 단축키가 안 먹으므로 F키/Esc 를 같이 보여준다.
     hints = {
-        "idle": [("Enter", "조회"), ("e/F2", "조건"), ("s/F3", "설정"),
-                 ("t/F4", "전환"), ("Esc", "종료")],
+        "idle": [("Enter", "조회"), ("e/F2", "조건"), ("l/F7", "내역"),
+                 ("s/F3", "설정"), ("t/F4", "전환"), ("Esc", "종료")],
         "picking": [("up/dn", "이동"), ("Space", "선택"), ("Enter", "시작"),
                     ("r/F5", "재조회"), ("Esc", "취소")],
         "running": [("p/F6", "일시정지"), ("Esc", "중지")],
@@ -594,8 +602,22 @@ def open_form(state, title, fields):
     state.notice = ""
 
 
+def open_choices(state, title, options, on_choose):
+    """Field 와 무관한 단발 선택 목록. 고르면 on_choose(value)."""
+    state.pick_field = None
+    state.pick_title = title
+    state.pick_opts = options
+    state.pick_multi = False
+    state.pick_sel = set()
+    state.pick_cur = 0
+    state.pick_commit = on_choose
+    state.screen = "pick"
+
+
 def open_picker(state, field):
     state.pick_field = field
+    state.pick_title = field.label
+    state.pick_commit = None
     state.pick_opts = field.choices
     state.pick_multi = field.kind == "multi"
     raw = field.raw()
@@ -611,6 +633,10 @@ def open_picker(state, field):
 
 
 def commit_picker(state):
+    if state.pick_commit is not None:
+        choose, state.pick_commit = state.pick_commit, None
+        choose(state.pick_opts[state.pick_cur][1])
+        return
     field = state.pick_field
     if state.pick_multi:
         values = [field.choices[i][1] for i in sorted(state.pick_sel)]
@@ -625,8 +651,8 @@ PICK_ROWS = 12
 
 
 def render_pick(state, line):
-    field = state.pick_field
-    line(("class:title", " " + pad(field.label, width() - 1)))
+    line(("class:title", " " + pad(clip(state.pick_title, width() - 1),
+                                   width() - 1)))
     line()
     total = len(state.pick_opts)
     top = max(0, min(state.pick_cur - PICK_ROWS // 2, total - PICK_ROWS))
@@ -825,6 +851,127 @@ def _spawn(fn, state, app):
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# 예매 내역 (조회 / 결제 / 취소 / 환불)
+
+
+def item_state(item):
+    """(꼬리표, 결제 가능 여부). 발권 끝난 표와 대기표는 결제할 게 없다."""
+    if getattr(item, "is_ticket", False):
+        return "발권", False
+    if getattr(item, "is_waiting", False):
+        return "대기", False
+    return "미결제", True
+
+
+def load_reservations(state, app):
+    """예약 + 발권 내역을 한 목록으로."""
+    if not _ensure_login(state, app):
+        return
+    _note(state, app, "내역 조회 중", "search")
+    try:
+        if state.rail_type == "SRT":
+            reservations, tickets = state.rail.get_reservations(), []
+        else:
+            reservations, tickets = state.rail.reservations(), state.rail.tickets()
+    except Exception as ex:
+        _note(state, app, f"조회 실패: {getattr(ex, 'msg', ex)}", "error")
+        return
+
+    items = []
+    for ticket in tickets:
+        ticket.is_ticket = True
+        items.append(ticket)
+    for rsv in reservations:
+        rsv.is_ticket = bool(getattr(rsv, "paid", False))
+        items.append(rsv)
+
+    state.rsv_items = items
+    state.rsv_cur = 0
+    state.screen = "rsv"
+    _note(state, app, f"{len(items)}건" if items else "예매 내역이 없습니다", "idle")
+    app.invalidate()
+
+
+def render_rsv(state, line):
+    line(("class:title", " " + pad("예매 내역", width() - 1)))
+    line()
+    if not state.rsv_items:
+        line(("class:dim", "  내역이 없습니다."))
+    for i, item in enumerate(state.rsv_items):
+        tag, _ = item_state(item)
+        head = " > " if i == state.rsv_cur else "   "
+        style = "class:value" if i == state.rsv_cur else "class:dim"
+        tag_style = {"발권": "class:ok", "대기": "class:warn"}.get(tag, "class:sold")
+        # [미결제] 는 8칸, [발권] 은 6칸이라 폭을 맞춰줘야 뒤가 안 밀린다.
+        line((style, head), (tag_style, pad(f"[{tag}]", 9)),
+             (style, clip(str(item), max(0, width() - 12))))
+        for seat in getattr(item, "tickets", None) or []:
+            line(("class:dim", clip(f"          {seat}", width())))
+    line()
+    if state.notice:
+        line(("class:warn", clip(f"  {state.notice}", width())))
+        line()
+    emit_hints(line, [("up/dn", "이동"), ("Enter", "결제/취소"),
+                      ("r/F5", "새로고침"), ("g", "텔레그램"), ("Esc", "돌아가기")])
+
+
+def open_item_actions(state, app):
+    if not state.rsv_items:
+        return
+    item = state.rsv_items[state.rsv_cur]
+    tag, payable = item_state(item)
+
+    def run(action):
+        def work(_state, _app):
+            try:
+                if action == "pay":
+                    ok = core.pay_card(state.rail, item)
+                    _note(state, app, "결제 성공" if ok else "결제 실패")
+                elif action == "refund":
+                    state.rail.refund(item)
+                    _note(state, app, "환불 요청함")
+                else:
+                    state.rail.cancel(item)
+                    _note(state, app, "취소함")
+            except Exception as ex:
+                _note(state, app, f"실패: {getattr(ex, 'msg', ex)}")
+                return
+            load_reservations(state, app)
+            state.screen = "rsv"
+        _spawn(work, state, app)
+
+    options = []
+    if payable:
+        options.append(("결제하기", "pay"))
+    options.append(("환불하기" if tag == "발권" else "취소하기",
+                    "refund" if tag == "발권" else "cancel"))
+    options.append(("그만두기", None))
+
+    def chosen(action):
+        state.screen = "rsv"
+        if action:
+            run(action)
+
+    open_choices(state, clip(str(item), width() - 2), options, chosen)
+
+
+def send_to_telegram(state, app):
+    if not state.rsv_items:
+        return
+    out = ["[ 예매 내역 ]"]
+    for item in state.rsv_items:
+        out.append(f"🚅{item}")
+        out += [str(s) for s in getattr(item, "tickets", None) or []]
+    try:
+        core.asyncio.run(core.get_telegram()("\n".join(out)))
+        state.notice = "텔레그램으로 보냈습니다"
+    except Exception as ex:
+        state.notice = f"텔레그램 실패: {ex}"
+    app.invalidate()
+
+
+
 def build_app(state):
     """상태 하나에 화면과 키를 묶는다. 테스트에서도 이 함수를 쓴다."""
     kb = KeyBindings()
@@ -848,6 +995,8 @@ def build_app(state):
         elif state.screen == "form" and state.fields:
             state.fcur = (state.fcur + delta) % len(state.fields)
             state.notice = ""
+        elif state.screen == "rsv" and state.rsv_items:
+            state.rsv_cur = (state.rsv_cur + delta) % len(state.rsv_items)
         elif state.screen == "dash" and state.trains:
             state.cursor = (state.cursor + delta) % len(state.trains)
 
@@ -873,7 +1022,12 @@ def build_app(state):
 
     @kb.add("escape", eager=True)
     def _(event):
-        if state.screen in ("edit", "pick"):
+        if state.screen == "rsv":
+            state.screen = "dash"
+        elif state.screen == "pick" and state.pick_field is None:
+            state.screen = "rsv" if state.rsv_items else "dash"
+            state.pick_commit = None
+        elif state.screen in ("edit", "pick"):
             state.screen = "form"
         elif state.screen == "form":
             state.screen = "dash"
@@ -899,6 +1053,9 @@ def build_app(state):
             field().save(state.buf)
             after_save(state, field())
             state.screen = "form"
+            return
+        if state.screen == "rsv":
+            open_item_actions(state, app)
             return
         if state.screen == "form":
             current = field()
@@ -971,6 +1128,13 @@ def build_app(state):
         if state.screen == "edit":
             state.screen = "form"  # c-c 는 입력 취소
             return
+        if state.screen == "rsv":
+            state.screen = "dash"
+            return
+        if state.screen == "pick" and state.pick_field is None:
+            state.pick_commit = None
+            state.screen = "rsv" if state.rsv_items else "dash"
+            return
         if state.screen in ("form", "pick"):
             state.screen = "form" if state.screen == "pick" else "dash"
             return
@@ -981,9 +1145,30 @@ def build_app(state):
     kb.add("c-c")(on_back)
     # escape 는 위쪽에서 form/pick/edit 을 처리한다. 대시보드에서만 q 와 같게.
 
-    shortcut("r", lambda event: (
-        _spawn(do_search, state, app)
-        if state.phase in ("picking", "idle", "error") else None))
+    def on_r(event):
+        if state.phase in ("picking", "idle", "error"):
+            _spawn(do_search, state, app)
+
+    for alias in key_aliases("r"):
+        @kb.add(alias, filter=not_typing)
+        def _(event, _alias=alias):
+            if state.screen == "rsv":
+                _spawn(load_reservations, state, app)
+            elif state.screen == "dash":
+                on_r(event)
+
+    for alias in key_aliases("g"):
+        @kb.add(alias, filter=not_typing)
+        def _(event, _alias=alias):
+            if state.screen == "rsv":
+                send_to_telegram(state, app)
+
+    def on_l(event):
+        if state.phase in ("running", "paused"):
+            return
+        _spawn(load_reservations, state, app)
+
+    shortcut("l", on_l)
 
     def on_p(event):
         if state.phase == "running":
