@@ -6,6 +6,7 @@
 메모리 저장소로 갈아끼운 뒤 돌린다.
 """
 
+import io as _io
 import threading
 import time
 
@@ -283,6 +284,39 @@ def test_reservation_screen_fits_width():
             assert widths == {columns}, f"{columns}칸: {sorted(widths)}"
     finally:
         tui.width = original
+
+
+def test_stray_print_cannot_reach_the_terminal():
+    """전체화면 중에 stdout 으로 새는 출력이 화면을 깨뜨리면 안 된다.
+
+    한 줄이라도 찍히면 터미널이 밀리고 윗줄이 복사되거나 잔상이 남는다.
+    """
+    fake_keyring()
+    state = tui.State("KTX")
+    sink = tui._StdoutSink(state)
+
+    import contextlib
+    import sys
+
+    captured = _io.StringIO()
+    real_stdout = sys.stdout
+    with contextlib.redirect_stdout(sink):
+        print("로그인 성공: 홍길동 (멤버십번호: 1234)")
+        print("현재 3명 대기중...")
+        assert sys.stdout is not real_stdout
+
+    assert captured.getvalue() == ""
+    assert state.notice == "현재 3명 대기중...", state.notice
+
+
+def test_libraries_do_not_print_on_login():
+    """ktx/srt 가 로그인 성공을 stdout 으로 찍으면 안 된다 (속성으로만)."""
+    from srtgo import ktx, srt
+    for module in (ktx, srt):
+        source = _io.open(module.__file__, encoding="utf-8").read()
+        offenders = [line.strip() for line in source.split(chr(10))
+                     if line.strip().startswith("print(") and "로그인" in line]
+        assert not offenders, f"{module.__name__}: {offenders}"
 
 
 def test_card_number_is_masked():

@@ -5,6 +5,8 @@
 keyring 키도 같아서, --classic 메뉴와 설정을 공유한다.
 """
 
+import contextlib
+import io as _io
 import threading
 import time
 from datetime import datetime, timedelta
@@ -1209,5 +1211,30 @@ def build_app(state):
     return app
 
 
+class _StdoutSink(_io.TextIOBase):
+    """전체화면 중에 새는 print 를 받아낸다.
+
+    라이브러리가 stdout 에 직접 쓰면 터미널이 한 줄 밀리고, prompt_toolkit 은
+    기억하던 위치로 다시 그리기 때문에 윗줄이 복사되거나 이전 프레임 글자가
+    남는다. 화면을 건드리지 못하게 가로채서 상태줄로 흘려보낸다.
+    """
+
+    def __init__(self, state):
+        self.state = state
+
+    def write(self, text):
+        stripped = text.strip()
+        if stripped:
+            self.state.notice = stripped.splitlines()[-1][:120]
+        return len(text)
+
+    def flush(self):
+        pass
+
+
 def run(rail_type="KTX", debug=False):
-    build_app(State(rail_type, debug)).run()
+    state = State(rail_type, debug)
+    app = build_app(state)
+    app.output          # 진짜 stdout 을 붙잡은 뒤에 가로챈다
+    with contextlib.redirect_stdout(_StdoutSink(state)):
+        app.run()

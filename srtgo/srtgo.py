@@ -460,11 +460,14 @@ def set_login(rail_type="SRT", debug=False):
         return False
 
     try:
-        SRT(
-            login_info["id"], login_info["pass"], verbose=debug
-        ) if rail_type == "SRT" else Korail(
-            login_info["id"], login_info["pass"], verbose=debug
+        rail = (
+            SRT(login_info["id"], login_info["pass"], verbose=debug)
+            if rail_type == "SRT"
+            else Korail(login_info["id"], login_info["pass"], verbose=debug)
         )
+        # 라이브러리는 더 이상 stdout 에 찍지 않는다 (전체화면 UI 를 깨뜨려서).
+        if getattr(rail, "login_message", ""):
+            print(rail.login_message)
 
         keyring.set_password(rail_type, "id", login_info["id"])
         keyring.set_password(rail_type, "pass", login_info["pass"])

@@ -750,6 +750,7 @@ class Korail:
         self.korail_pw = korail_pw
         self.verbose = verbose
         self.logined = False
+        self.login_message = ""
         self.membership_number = None
         self.name = None
         self.email = None
@@ -855,8 +856,12 @@ class Korail:
                         self.name = j["strCustNm"]
                         self.email = j["strEmailAdr"]
                         self.phone_number = j["strCpNo"]
-                        print(
-                            f"로그인 성공: {self.name} (멤버십번호: {self.membership_number}, 전화번호: {self.phone_number})"
+                        # 전체화면 UI 가 도는 중에 stdout 으로 찍으면 화면
+                        # 계산이 어긋나 잔상이 남는다. 호출한 쪽이 알아서 쓴다.
+                        self.login_message = (
+                            f"로그인 성공: {self.name} "
+                            f"(멤버십번호: {self.membership_number}, "
+                            f"전화번호: {self.phone_number})"
                         )
                         self.logined = True
                         return True
